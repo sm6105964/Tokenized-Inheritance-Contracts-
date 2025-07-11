@@ -6,6 +6,8 @@
 (define-constant err-no-inheritance (err u104))
 (define-constant err-not-heir (err u105))
 (define-constant err-still-active (err u106))
+(define-constant err-invalid-percentage (err u107))
+(define-constant err-not-beneficiary (err u108))
 
 (define-data-var last-activity uint u0)
 (define-data-var inactivity-period uint u0)
@@ -14,6 +16,15 @@
     { owner: principal }
     {
         heir: principal,
+        amount: uint,
+        asset-type: (string-ascii 10),
+    }
+)
+
+(define-map multi-beneficiaries
+    { owner: principal, beneficiary: principal }
+    {
+        percentage: uint,
         amount: uint,
         asset-type: (string-ascii 10),
     }
@@ -110,5 +121,67 @@
             (map-delete inheritances { owner: owner })
             (ok true)
         )
+    )
+)
+
+(define-public (setup-multi-beneficiary
+        (beneficiary principal)
+        (percentage uint)
+        (amount uint)
+        (asset-type (string-ascii 10))
+    )
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (and (>= percentage u1) (<= percentage u100)) err-invalid-percentage)
+        (map-set multi-beneficiaries 
+            { owner: tx-sender, beneficiary: beneficiary }
+            {
+                percentage: percentage,
+                amount: amount,
+                asset-type: asset-type,
+            }
+        )
+        (var-set last-activity burn-block-height)
+        (ok true)
+    )
+)
+
+(define-public (update-beneficiary-percentage 
+        (beneficiary principal)
+        (new-percentage uint)
+    )
+    (let ((beneficiary-data (unwrap! (map-get? multi-beneficiaries { owner: tx-sender, beneficiary: beneficiary }) err-not-beneficiary)))
+        (begin
+            (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+            (asserts! (and (>= new-percentage u1) (<= new-percentage u100)) err-invalid-percentage)
+            (map-set multi-beneficiaries 
+                { owner: tx-sender, beneficiary: beneficiary }
+                (merge beneficiary-data { percentage: new-percentage })
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-public (claim-multi-beneficiary-inheritance (owner principal))
+    (let (
+            (beneficiary-data (unwrap! (map-get? multi-beneficiaries { owner: owner, beneficiary: tx-sender }) err-not-beneficiary))
+            (inactive-blocks (- burn-block-height (var-get last-activity)))
+        )
+        (begin
+            (asserts! (>= inactive-blocks (var-get inactivity-period)) err-still-active)
+            (map-delete multi-beneficiaries { owner: owner, beneficiary: tx-sender })
+            (ok true)
+        )
+    )
+)
+
+(define-read-only (get-beneficiary-info (owner principal) (beneficiary principal))
+    (map-get? multi-beneficiaries { owner: owner, beneficiary: beneficiary })
+)
+
+(define-read-only (calculate-beneficiary-amount (owner principal) (beneficiary principal) (total-amount uint))
+    (let ((beneficiary-data (unwrap! (map-get? multi-beneficiaries { owner: owner, beneficiary: beneficiary }) err-not-beneficiary)))
+        (ok (/ (* total-amount (get percentage beneficiary-data)) u100))
     )
 )
