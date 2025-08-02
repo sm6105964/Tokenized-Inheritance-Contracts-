@@ -8,9 +8,16 @@
 (define-constant err-still-active (err u106))
 (define-constant err-invalid-percentage (err u107))
 (define-constant err-not-beneficiary (err u108))
+(define-constant err-not-emergency-contact (err u109))
+(define-constant err-challenge-period-active (err u110))
+(define-constant err-no-challenge-exists (err u111))
+(define-constant err-no-vesting-schedule (err u112))
+(define-constant err-vesting-not-active (err u113))
+(define-constant err-no-claimable-amount (err u114))
 
 (define-data-var last-activity uint u0)
 (define-data-var inactivity-period uint u0)
+(define-data-var challenge-period uint u144)
 
 (define-map inheritances
     { owner: principal }
@@ -22,11 +29,47 @@
 )
 
 (define-map multi-beneficiaries
-    { owner: principal, beneficiary: principal }
+    {
+        owner: principal,
+        beneficiary: principal,
+    }
     {
         percentage: uint,
         amount: uint,
         asset-type: (string-ascii 10),
+    }
+)
+
+(define-map emergency-contacts
+    {
+        owner: principal,
+        contact: principal,
+    }
+    { active: bool }
+)
+
+(define-map inheritance-challenges
+    {
+        owner: principal,
+        challenger: principal,
+    }
+    {
+        challenge-block: uint,
+        heir: principal,
+        challenge-reason: (string-ascii 50),
+    }
+)
+
+(define-map vesting-schedules
+    { owner: principal }
+    {
+        total-amount: uint,
+        start-block: uint,
+        cliff-period: uint,
+        vesting-period: uint,
+        claimed-amount: uint,
+        asset-type: (string-ascii 10),
+        heir: principal,
     }
 )
 
@@ -132,30 +175,42 @@
     )
     (begin
         (asserts! (is-eq tx-sender contract-owner) err-owner-only)
-        (asserts! (and (>= percentage u1) (<= percentage u100)) err-invalid-percentage)
-        (map-set multi-beneficiaries 
-            { owner: tx-sender, beneficiary: beneficiary }
-            {
-                percentage: percentage,
-                amount: amount,
-                asset-type: asset-type,
-            }
+        (asserts! (and (>= percentage u1) (<= percentage u100))
+            err-invalid-percentage
         )
+        (map-set multi-beneficiaries {
+            owner: tx-sender,
+            beneficiary: beneficiary,
+        } {
+            percentage: percentage,
+            amount: amount,
+            asset-type: asset-type,
+        })
         (var-set last-activity burn-block-height)
         (ok true)
     )
 )
 
-(define-public (update-beneficiary-percentage 
+(define-public (update-beneficiary-percentage
         (beneficiary principal)
         (new-percentage uint)
     )
-    (let ((beneficiary-data (unwrap! (map-get? multi-beneficiaries { owner: tx-sender, beneficiary: beneficiary }) err-not-beneficiary)))
+    (let ((beneficiary-data (unwrap!
+            (map-get? multi-beneficiaries {
+                owner: tx-sender,
+                beneficiary: beneficiary,
+            })
+            err-not-beneficiary
+        )))
         (begin
             (asserts! (is-eq tx-sender contract-owner) err-owner-only)
-            (asserts! (and (>= new-percentage u1) (<= new-percentage u100)) err-invalid-percentage)
-            (map-set multi-beneficiaries 
-                { owner: tx-sender, beneficiary: beneficiary }
+            (asserts! (and (>= new-percentage u1) (<= new-percentage u100))
+                err-invalid-percentage
+            )
+            (map-set multi-beneficiaries {
+                owner: tx-sender,
+                beneficiary: beneficiary,
+            }
                 (merge beneficiary-data { percentage: new-percentage })
             )
             (ok true)
@@ -165,23 +220,255 @@
 
 (define-public (claim-multi-beneficiary-inheritance (owner principal))
     (let (
-            (beneficiary-data (unwrap! (map-get? multi-beneficiaries { owner: owner, beneficiary: tx-sender }) err-not-beneficiary))
+            (beneficiary-data (unwrap!
+                (map-get? multi-beneficiaries {
+                    owner: owner,
+                    beneficiary: tx-sender,
+                })
+                err-not-beneficiary
+            ))
             (inactive-blocks (- burn-block-height (var-get last-activity)))
         )
         (begin
-            (asserts! (>= inactive-blocks (var-get inactivity-period)) err-still-active)
-            (map-delete multi-beneficiaries { owner: owner, beneficiary: tx-sender })
+            (asserts! (>= inactive-blocks (var-get inactivity-period))
+                err-still-active
+            )
+            (map-delete multi-beneficiaries {
+                owner: owner,
+                beneficiary: tx-sender,
+            })
             (ok true)
         )
     )
 )
 
-(define-read-only (get-beneficiary-info (owner principal) (beneficiary principal))
-    (map-get? multi-beneficiaries { owner: owner, beneficiary: beneficiary })
+(define-read-only (get-beneficiary-info
+        (owner principal)
+        (beneficiary principal)
+    )
+    (map-get? multi-beneficiaries {
+        owner: owner,
+        beneficiary: beneficiary,
+    })
 )
 
-(define-read-only (calculate-beneficiary-amount (owner principal) (beneficiary principal) (total-amount uint))
-    (let ((beneficiary-data (unwrap! (map-get? multi-beneficiaries { owner: owner, beneficiary: beneficiary }) err-not-beneficiary)))
+(define-read-only (calculate-beneficiary-amount
+        (owner principal)
+        (beneficiary principal)
+        (total-amount uint)
+    )
+    (let ((beneficiary-data (unwrap!
+            (map-get? multi-beneficiaries {
+                owner: owner,
+                beneficiary: beneficiary,
+            })
+            err-not-beneficiary
+        )))
         (ok (/ (* total-amount (get percentage beneficiary-data)) u100))
     )
+)
+
+(define-public (designate-emergency-contact (contact principal))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (map-set emergency-contacts {
+            owner: tx-sender,
+            contact: contact,
+        } { active: true }
+        )
+        (ok true)
+    )
+)
+
+(define-public (revoke-emergency-contact (contact principal))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (map-delete emergency-contacts {
+            owner: tx-sender,
+            contact: contact,
+        })
+        (ok true)
+    )
+)
+
+(define-public (challenge-inheritance
+        (owner principal)
+        (reason (string-ascii 50))
+    )
+    (let (
+            (inheritance (unwrap! (map-get? inheritances { owner: owner }) err-not-initialized))
+            (contact-data (unwrap!
+                (map-get? emergency-contacts {
+                    owner: owner,
+                    contact: tx-sender,
+                })
+                err-not-emergency-contact
+            ))
+        )
+        (begin
+            (asserts! (get active contact-data) err-not-emergency-contact)
+            (map-set inheritance-challenges {
+                owner: owner,
+                challenger: tx-sender,
+            } {
+                challenge-block: burn-block-height,
+                heir: (get heir inheritance),
+                challenge-reason: reason,
+            })
+            (ok true)
+        )
+    )
+)
+
+(define-public (resolve-challenge
+        (owner principal)
+        (challenger principal)
+    )
+    (let ((challenge-data (unwrap!
+            (map-get? inheritance-challenges {
+                owner: owner,
+                challenger: challenger,
+            })
+            err-no-challenge-exists
+        )))
+        (begin
+            (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+            (map-delete inheritance-challenges {
+                owner: owner,
+                challenger: challenger,
+            })
+            (var-set last-activity burn-block-height)
+            (ok true)
+        )
+    )
+)
+
+(define-public (claim-inheritance-with-deadman-switch (owner principal))
+    (let (
+            (inheritance (unwrap! (map-get? inheritances { owner: owner }) err-no-inheritance))
+            (inactive-blocks (- burn-block-height (var-get last-activity)))
+        )
+        (begin
+            (asserts! (is-eq (get heir inheritance) tx-sender) err-not-heir)
+            (asserts! (>= inactive-blocks (var-get inactivity-period))
+                err-still-active
+            )
+            (map-delete inheritances { owner: owner })
+            (ok true)
+        )
+    )
+)
+
+(define-read-only (get-active-challenge (owner principal))
+    (ok none)
+)
+
+(define-read-only (get-emergency-contact
+        (owner principal)
+        (contact principal)
+    )
+    (map-get? emergency-contacts {
+        owner: owner,
+        contact: contact,
+    })
+)
+
+(define-read-only (get-challenge-info
+        (owner principal)
+        (challenger principal)
+    )
+    (map-get? inheritance-challenges {
+        owner: owner,
+        challenger: challenger,
+    })
+)
+
+(define-public (create-vesting-schedule
+        (heir principal)
+        (total-amount uint)
+        (cliff-period uint)
+        (vesting-period uint)
+        (asset-type (string-ascii 10))
+    )
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (is-none (map-get? vesting-schedules { owner: tx-sender }))
+            err-already-initialized
+        )
+        (map-set vesting-schedules { owner: tx-sender } {
+            total-amount: total-amount,
+            start-block: burn-block-height,
+            cliff-period: cliff-period,
+            vesting-period: vesting-period,
+            claimed-amount: u0,
+            asset-type: asset-type,
+            heir: heir,
+        })
+        (var-set last-activity burn-block-height)
+        (ok true)
+    )
+)
+
+(define-read-only (calculate-vested-amount (owner principal))
+    (let (
+            (schedule (unwrap! (map-get? vesting-schedules { owner: owner })
+                err-no-vesting-schedule
+            ))
+            (inactive-blocks (- burn-block-height (var-get last-activity)))
+            (elapsed-blocks (- burn-block-height (get start-block schedule)))
+            (cliff-blocks (get cliff-period schedule))
+            (vesting-blocks (get vesting-period schedule))
+            (total-amount (get total-amount schedule))
+        )
+        (if (>= inactive-blocks (var-get inactivity-period))
+            (if (< elapsed-blocks cliff-blocks)
+                (ok u0)
+                (if (>= elapsed-blocks (+ cliff-blocks vesting-blocks))
+                    (ok total-amount)
+                    (let ((vesting-progress (- elapsed-blocks cliff-blocks)))
+                        (ok (/ (* total-amount vesting-progress) vesting-blocks))
+                    )
+                )
+            )
+            err-vesting-not-active
+        )
+    )
+)
+
+(define-read-only (get-claimable-amount (owner principal))
+    (let (
+            (schedule (unwrap! (map-get? vesting-schedules { owner: owner })
+                err-no-vesting-schedule
+            ))
+            (vested-amount (unwrap! (calculate-vested-amount owner) err-vesting-not-active))
+            (claimed-amount (get claimed-amount schedule))
+        )
+        (if (> vested-amount claimed-amount)
+            (ok (- vested-amount claimed-amount))
+            (ok u0)
+        )
+    )
+)
+
+(define-public (claim-vested-inheritance (owner principal))
+    (let (
+            (schedule (unwrap! (map-get? vesting-schedules { owner: owner })
+                err-no-vesting-schedule
+            ))
+            (claimable-amount (unwrap! (get-claimable-amount owner) err-no-claimable-amount))
+            (current-claimed (get claimed-amount schedule))
+        )
+        (begin
+            (asserts! (is-eq (get heir schedule) tx-sender) err-not-heir)
+            (asserts! (> claimable-amount u0) err-no-claimable-amount)
+            (map-set vesting-schedules { owner: owner }
+                (merge schedule { claimed-amount: (+ current-claimed claimable-amount) })
+            )
+            (ok claimable-amount)
+        )
+    )
+)
+
+(define-read-only (get-vesting-schedule (owner principal))
+    (map-get? vesting-schedules { owner: owner })
 )
