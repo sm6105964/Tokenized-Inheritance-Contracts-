@@ -14,6 +14,9 @@
 (define-constant err-no-vesting-schedule (err u112))
 (define-constant err-vesting-not-active (err u113))
 (define-constant err-no-claimable-amount (err u114))
+(define-constant err-not-recovery-agent (err u115))
+(define-constant err-recovery-period-not-met (err u116))
+(define-constant recovery-period-multiplier u3)
 
 (define-data-var last-activity uint u0)
 (define-data-var inactivity-period uint u0)
@@ -71,6 +74,14 @@
         asset-type: (string-ascii 10),
         heir: principal,
     }
+)
+
+(define-map recovery-agents
+    {
+        owner: principal,
+        agent: principal,
+    }
+    { active: bool }
 )
 
 (define-public (initialize-inheritance
@@ -471,4 +482,100 @@
 
 (define-read-only (get-vesting-schedule (owner principal))
     (map-get? vesting-schedules { owner: owner })
+)
+
+(define-public (designate-recovery-agent (agent principal))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (map-set recovery-agents {
+            owner: tx-sender,
+            agent: agent,
+        } { active: true }
+        )
+        (ok true)
+    )
+)
+
+(define-public (revoke-recovery-agent (agent principal))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (map-delete recovery-agents {
+            owner: tx-sender,
+            agent: agent,
+        })
+        (ok true)
+    )
+)
+
+(define-read-only (check-recovery-eligibility (owner principal))
+    (let (
+            (inheritance (unwrap! (map-get? inheritances { owner: owner }) err-not-initialized))
+            (inactive-blocks (- burn-block-height (var-get last-activity)))
+            (required-period (* (var-get inactivity-period) recovery-period-multiplier))
+        )
+        (if (>= inactive-blocks required-period)
+            (ok true)
+            err-recovery-period-not-met
+        )
+    )
+)
+
+(define-public (recovery-claim-inheritance (owner principal))
+    (let (
+            (inheritance (unwrap! (map-get? inheritances { owner: owner }) err-no-inheritance))
+            (agent-data (unwrap!
+                (map-get? recovery-agents {
+                    owner: owner,
+                    agent: tx-sender,
+                })
+                err-not-recovery-agent
+            ))
+            (inactive-blocks (- burn-block-height (var-get last-activity)))
+            (required-period (* (var-get inactivity-period) recovery-period-multiplier))
+        )
+        (begin
+            (asserts! (get active agent-data) err-not-recovery-agent)
+            (asserts! (>= inactive-blocks required-period)
+                err-recovery-period-not-met
+            )
+            (map-delete inheritances { owner: owner })
+            (ok true)
+        )
+    )
+)
+
+(define-public (recovery-claim-vesting (owner principal))
+    (let (
+            (schedule (unwrap! (map-get? vesting-schedules { owner: owner })
+                err-no-vesting-schedule
+            ))
+            (agent-data (unwrap!
+                (map-get? recovery-agents {
+                    owner: owner,
+                    agent: tx-sender,
+                })
+                err-not-recovery-agent
+            ))
+            (inactive-blocks (- burn-block-height (var-get last-activity)))
+            (required-period (* (var-get inactivity-period) recovery-period-multiplier))
+        )
+        (begin
+            (asserts! (get active agent-data) err-not-recovery-agent)
+            (asserts! (>= inactive-blocks required-period)
+                err-recovery-period-not-met
+            )
+            (map-delete vesting-schedules { owner: owner })
+            (ok (get total-amount schedule))
+        )
+    )
+)
+
+(define-read-only (get-recovery-agent
+        (owner principal)
+        (agent principal)
+    )
+    (map-get? recovery-agents {
+        owner: owner,
+        agent: agent,
+    })
 )
