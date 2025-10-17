@@ -16,11 +16,19 @@
 (define-constant err-no-claimable-amount (err u114))
 (define-constant err-not-recovery-agent (err u115))
 (define-constant err-recovery-period-not-met (err u116))
+(define-constant err-escrow-not-found (err u117))
+(define-constant err-not-escrow-party (err u118))
+(define-constant err-escrow-already-released (err u119))
+(define-constant err-escrow-conditions-not-met (err u120))
+(define-constant err-invalid-escrow-amount (err u121))
+(define-constant err-escrow-expired (err u122))
+(define-constant err-escrow-not-expired (err u123))
 (define-constant recovery-period-multiplier u3)
 
 (define-data-var last-activity uint u0)
 (define-data-var inactivity-period uint u0)
 (define-data-var challenge-period uint u144)
+(define-data-var escrow-counter uint u0)
 
 (define-map inheritances
     { owner: principal }
@@ -82,6 +90,32 @@
         agent: principal,
     }
     { active: bool }
+)
+
+;; Asset Escrow System Maps
+(define-map escrow-agreements
+    { escrow-id: uint }
+    {
+        payer: principal,
+        payee: principal,
+        amount: uint,
+        asset-type: (string-ascii 20),
+        conditions: (string-ascii 100),
+        expiry-block: uint,
+        status: (string-ascii 10),
+        created-block: uint,
+        released-block: (optional uint)
+    }
+)
+
+(define-map escrow-disputes
+    { escrow-id: uint }
+    {
+        disputer: principal,
+        reason: (string-ascii 100),
+        dispute-block: uint,
+        resolved: bool
+    }
 )
 
 (define-public (initialize-inheritance
@@ -578,4 +612,161 @@
         owner: owner,
         agent: agent,
     })
+)
+
+;; Asset Escrow System Functions
+(define-public (create-escrow-agreement
+        (payee principal)
+        (amount uint)
+        (asset-type (string-ascii 20))
+        (conditions (string-ascii 100))
+        (expiry-blocks uint)
+    )
+    (let ((new-escrow-id (+ (var-get escrow-counter) u1)))
+        (begin
+            (asserts! (> amount u0) err-invalid-escrow-amount)
+            (asserts! (> expiry-blocks u0) err-invalid-escrow-amount)
+            (asserts! (not (is-eq tx-sender payee)) err-invalid-heir)
+            (map-set escrow-agreements { escrow-id: new-escrow-id } {
+                payer: tx-sender,
+                payee: payee,
+                amount: amount,
+                asset-type: asset-type,
+                conditions: conditions,
+                expiry-block: (+ burn-block-height expiry-blocks),
+                status: "active",
+                created-block: burn-block-height,
+                released-block: none
+            })
+            (var-set escrow-counter new-escrow-id)
+            (ok new-escrow-id)
+        )
+    )
+)
+
+(define-public (release-escrow (escrow-id uint))
+    (let ((escrow-data (unwrap! (map-get? escrow-agreements { escrow-id: escrow-id })
+            err-escrow-not-found
+        )))
+        (begin
+            (asserts! (or (is-eq tx-sender (get payer escrow-data))
+                         (is-eq tx-sender (get payee escrow-data)))
+                err-not-escrow-party
+            )
+            (asserts! (is-eq (get status escrow-data) "active")
+                err-escrow-already-released
+            )
+            (map-set escrow-agreements { escrow-id: escrow-id }
+                (merge escrow-data {
+                    status: "released",
+                    released-block: (some burn-block-height)
+                })
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-public (claim-expired-escrow (escrow-id uint))
+    (let ((escrow-data (unwrap! (map-get? escrow-agreements { escrow-id: escrow-id })
+            err-escrow-not-found
+        )))
+        (begin
+            (asserts! (is-eq tx-sender (get payer escrow-data)) err-not-escrow-party)
+            (asserts! (is-eq (get status escrow-data) "active") err-escrow-already-released)
+            (asserts! (>= burn-block-height (get expiry-block escrow-data))
+                err-escrow-not-expired
+            )
+            (map-set escrow-agreements { escrow-id: escrow-id }
+                (merge escrow-data {
+                    status: "expired",
+                    released-block: (some burn-block-height)
+                })
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-public (dispute-escrow
+        (escrow-id uint)
+        (reason (string-ascii 100))
+    )
+    (let ((escrow-data (unwrap! (map-get? escrow-agreements { escrow-id: escrow-id })
+            err-escrow-not-found
+        )))
+        (begin
+            (asserts! (or (is-eq tx-sender (get payer escrow-data))
+                         (is-eq tx-sender (get payee escrow-data)))
+                err-not-escrow-party
+            )
+            (asserts! (is-eq (get status escrow-data) "active")
+                err-escrow-already-released
+            )
+            (map-set escrow-disputes { escrow-id: escrow-id } {
+                disputer: tx-sender,
+                reason: reason,
+                dispute-block: burn-block-height,
+                resolved: false
+            })
+            (map-set escrow-agreements { escrow-id: escrow-id }
+                (merge escrow-data { status: "disputed" })
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-public (resolve-escrow-dispute
+        (escrow-id uint)
+        (release-to-payee bool)
+    )
+    (let (
+            (escrow-data (unwrap! (map-get? escrow-agreements { escrow-id: escrow-id })
+                err-escrow-not-found
+            ))
+            (dispute-data (unwrap! (map-get? escrow-disputes { escrow-id: escrow-id })
+                err-escrow-not-found
+            ))
+        )
+        (begin
+            (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+            (asserts! (is-eq (get status escrow-data) "disputed")
+                err-escrow-conditions-not-met
+            )
+            (map-set escrow-disputes { escrow-id: escrow-id }
+                (merge dispute-data { resolved: true })
+            )
+            (map-set escrow-agreements { escrow-id: escrow-id }
+                (merge escrow-data {
+                    status: (if release-to-payee "released" "cancelled"),
+                    released-block: (some burn-block-height)
+                })
+            )
+            (ok release-to-payee)
+        )
+    )
+)
+
+(define-read-only (get-escrow-details (escrow-id uint))
+    (map-get? escrow-agreements { escrow-id: escrow-id })
+)
+
+(define-read-only (get-escrow-dispute (escrow-id uint))
+    (map-get? escrow-disputes { escrow-id: escrow-id })
+)
+
+(define-read-only (check-escrow-expiry (escrow-id uint))
+    (let ((escrow-data (unwrap! (map-get? escrow-agreements { escrow-id: escrow-id })
+            err-escrow-not-found
+        )))
+        (if (>= burn-block-height (get expiry-block escrow-data))
+            (ok true)
+            (ok false)
+        )
+    )
+)
+
+(define-read-only (get-active-escrows-count)
+    (ok (var-get escrow-counter))
 )
