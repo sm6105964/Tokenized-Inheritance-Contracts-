@@ -71,6 +71,14 @@
     }
 )
 
+(define-map challenge-counters
+    { owner: principal }
+    {
+        count: uint,
+        last-challenge-block: uint,
+    }
+)
+
 (define-map vesting-schedules
     { owner: principal }
     {
@@ -104,7 +112,7 @@
         expiry-block: uint,
         status: (string-ascii 10),
         created-block: uint,
-        released-block: (optional uint)
+        released-block: (optional uint),
     }
 )
 
@@ -114,7 +122,7 @@
         disputer: principal,
         reason: (string-ascii 100),
         dispute-block: uint,
-        resolved: bool
+        resolved: bool,
     }
 )
 
@@ -142,6 +150,14 @@
     (begin
         (asserts! (is-eq tx-sender contract-owner) err-owner-only)
         (var-set inactivity-period blocks)
+        (ok true)
+    )
+)
+
+(define-public (set-challenge-period (blocks uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (var-set challenge-period blocks)
         (ok true)
     )
 )
@@ -196,16 +212,45 @@
     )
 )
 
+(define-read-only (get-active-challenge-count (owner principal))
+    (let (
+            (counter (default-to {
+                count: u0,
+                last-challenge-block: u0,
+            }
+                (map-get? challenge-counters { owner: owner })
+            ))
+            (cnt (get count counter))
+            (last (get last-challenge-block counter))
+            (expires (+ last (var-get challenge-period)))
+        )
+        (if (and (> cnt u0) (< burn-block-height expires))
+            (ok cnt)
+            (ok u0)
+        )
+    )
+)
+
 (define-public (claim-inheritance (owner principal))
     (let (
             (inheritance (unwrap! (map-get? inheritances { owner: owner }) err-no-inheritance))
             (inactive-blocks (- burn-block-height (var-get last-activity)))
+            (counter (default-to {
+                count: u0,
+                last-challenge-block: u0,
+            }
+                (map-get? challenge-counters { owner: owner })
+            ))
+            (active? (and (> (get count counter) u0) (< burn-block-height
+                (+ (get last-challenge-block counter) (var-get challenge-period))
+            )))
         )
         (begin
             (asserts! (is-eq (get heir inheritance) tx-sender) err-not-heir)
             (asserts! (>= inactive-blocks (var-get inactivity-period))
                 err-still-active
             )
+            (asserts! (not active?) err-challenge-period-active)
             (map-delete inheritances { owner: owner })
             (ok true)
         )
@@ -273,11 +318,21 @@
                 err-not-beneficiary
             ))
             (inactive-blocks (- burn-block-height (var-get last-activity)))
+            (counter (default-to {
+                count: u0,
+                last-challenge-block: u0,
+            }
+                (map-get? challenge-counters { owner: owner })
+            ))
+            (active? (and (> (get count counter) u0) (< burn-block-height
+                (+ (get last-challenge-block counter) (var-get challenge-period))
+            )))
         )
         (begin
             (asserts! (>= inactive-blocks (var-get inactivity-period))
                 err-still-active
             )
+            (asserts! (not active?) err-challenge-period-active)
             (map-delete multi-beneficiaries {
                 owner: owner,
                 beneficiary: tx-sender,
@@ -349,6 +404,13 @@
                 })
                 err-not-emergency-contact
             ))
+            (existing (default-to {
+                count: u0,
+                last-challenge-block: u0,
+            }
+                (map-get? challenge-counters { owner: owner })
+            ))
+            (new-count (+ (get count existing) u1))
         )
         (begin
             (asserts! (get active contact-data) err-not-emergency-contact)
@@ -360,6 +422,10 @@
                 heir: (get heir inheritance),
                 challenge-reason: reason,
             })
+            (map-set challenge-counters { owner: owner } {
+                count: new-count,
+                last-challenge-block: burn-block-height,
+            })
             (ok true)
         )
     )
@@ -369,18 +435,35 @@
         (owner principal)
         (challenger principal)
     )
-    (let ((challenge-data (unwrap!
-            (map-get? inheritance-challenges {
-                owner: owner,
-                challenger: challenger,
-            })
-            err-no-challenge-exists
-        )))
+    (let (
+            (challenge-data (unwrap!
+                (map-get? inheritance-challenges {
+                    owner: owner,
+                    challenger: challenger,
+                })
+                err-no-challenge-exists
+            ))
+            (existing (default-to {
+                count: u0,
+                last-challenge-block: u0,
+            }
+                (map-get? challenge-counters { owner: owner })
+            ))
+            (old-count (get count existing))
+            (new-count (if (> old-count u0)
+                (- old-count u1)
+                u0
+            ))
+        )
         (begin
             (asserts! (is-eq tx-sender contract-owner) err-owner-only)
             (map-delete inheritance-challenges {
                 owner: owner,
                 challenger: challenger,
+            })
+            (map-set challenge-counters { owner: owner } {
+                count: new-count,
+                last-challenge-block: burn-block-height,
             })
             (var-set last-activity burn-block-height)
             (ok true)
@@ -392,12 +475,22 @@
     (let (
             (inheritance (unwrap! (map-get? inheritances { owner: owner }) err-no-inheritance))
             (inactive-blocks (- burn-block-height (var-get last-activity)))
+            (counter (default-to {
+                count: u0,
+                last-challenge-block: u0,
+            }
+                (map-get? challenge-counters { owner: owner })
+            ))
+            (active? (and (> (get count counter) u0) (< burn-block-height
+                (+ (get last-challenge-block counter) (var-get challenge-period))
+            )))
         )
         (begin
             (asserts! (is-eq (get heir inheritance) tx-sender) err-not-heir)
             (asserts! (>= inactive-blocks (var-get inactivity-period))
                 err-still-active
             )
+            (asserts! (not active?) err-challenge-period-active)
             (map-delete inheritances { owner: owner })
             (ok true)
         )
@@ -502,10 +595,20 @@
             ))
             (claimable-amount (unwrap! (get-claimable-amount owner) err-no-claimable-amount))
             (current-claimed (get claimed-amount schedule))
+            (counter (default-to {
+                count: u0,
+                last-challenge-block: u0,
+            }
+                (map-get? challenge-counters { owner: owner })
+            ))
+            (active? (and (> (get count counter) u0) (< burn-block-height
+                (+ (get last-challenge-block counter) (var-get challenge-period))
+            )))
         )
         (begin
             (asserts! (is-eq (get heir schedule) tx-sender) err-not-heir)
             (asserts! (> claimable-amount u0) err-no-claimable-amount)
+            (asserts! (not active?) err-challenge-period-active)
             (map-set vesting-schedules { owner: owner }
                 (merge schedule { claimed-amount: (+ current-claimed claimable-amount) })
             )
@@ -636,7 +739,7 @@
                 expiry-block: (+ burn-block-height expiry-blocks),
                 status: "active",
                 created-block: burn-block-height,
-                released-block: none
+                released-block: none,
             })
             (var-set escrow-counter new-escrow-id)
             (ok new-escrow-id)
@@ -649,8 +752,11 @@
             err-escrow-not-found
         )))
         (begin
-            (asserts! (or (is-eq tx-sender (get payer escrow-data))
-                         (is-eq tx-sender (get payee escrow-data)))
+            (asserts!
+                (or
+                    (is-eq tx-sender (get payer escrow-data))
+                    (is-eq tx-sender (get payee escrow-data))
+                )
                 err-not-escrow-party
             )
             (asserts! (is-eq (get status escrow-data) "active")
@@ -659,7 +765,7 @@
             (map-set escrow-agreements { escrow-id: escrow-id }
                 (merge escrow-data {
                     status: "released",
-                    released-block: (some burn-block-height)
+                    released-block: (some burn-block-height),
                 })
             )
             (ok true)
@@ -672,15 +778,19 @@
             err-escrow-not-found
         )))
         (begin
-            (asserts! (is-eq tx-sender (get payer escrow-data)) err-not-escrow-party)
-            (asserts! (is-eq (get status escrow-data) "active") err-escrow-already-released)
+            (asserts! (is-eq tx-sender (get payer escrow-data))
+                err-not-escrow-party
+            )
+            (asserts! (is-eq (get status escrow-data) "active")
+                err-escrow-already-released
+            )
             (asserts! (>= burn-block-height (get expiry-block escrow-data))
                 err-escrow-not-expired
             )
             (map-set escrow-agreements { escrow-id: escrow-id }
                 (merge escrow-data {
                     status: "expired",
-                    released-block: (some burn-block-height)
+                    released-block: (some burn-block-height),
                 })
             )
             (ok true)
@@ -696,8 +806,11 @@
             err-escrow-not-found
         )))
         (begin
-            (asserts! (or (is-eq tx-sender (get payer escrow-data))
-                         (is-eq tx-sender (get payee escrow-data)))
+            (asserts!
+                (or
+                    (is-eq tx-sender (get payer escrow-data))
+                    (is-eq tx-sender (get payee escrow-data))
+                )
                 err-not-escrow-party
             )
             (asserts! (is-eq (get status escrow-data) "active")
@@ -707,7 +820,7 @@
                 disputer: tx-sender,
                 reason: reason,
                 dispute-block: burn-block-height,
-                resolved: false
+                resolved: false,
             })
             (map-set escrow-agreements { escrow-id: escrow-id }
                 (merge escrow-data { status: "disputed" })
@@ -739,8 +852,11 @@
             )
             (map-set escrow-agreements { escrow-id: escrow-id }
                 (merge escrow-data {
-                    status: (if release-to-payee "released" "cancelled"),
-                    released-block: (some burn-block-height)
+                    status: (if release-to-payee
+                        "released"
+                        "cancelled"
+                    ),
+                    released-block: (some burn-block-height),
                 })
             )
             (ok release-to-payee)
